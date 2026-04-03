@@ -17,6 +17,8 @@ import json
 import sys
 import time
 import logging
+import os
+import yaml
 from http import HTTPStatus
 from pathlib import Path
 
@@ -46,7 +48,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DASHSCOPE_API_KEY          = "sk-4f5ae3095bc04c259412db341254b745"
+# 加载配置文件
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yml")
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    CONFIG = yaml.safe_load(f)
+
+DASHSCOPE_API_KEY          = CONFIG["api_keys"]["dashscope"]
 DASHSCOPE_EMBED_MODEL      = "text-embedding-v4"
 DASHSCOPE_EMBED_DIMENSIONS = 1024
 DASHSCOPE_BATCH_SIZE       = 10

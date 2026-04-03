@@ -1,4 +1,5 @@
 import os
+import yaml
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
 from langchain.tools import tool
@@ -20,6 +21,13 @@ from search_tools import search_file as chroma_search
 
 KEEP_MESSAGE_COUNT = 31  # 总消息阈值
 KEEP_RECENT_MESSAGES = 13  # 保留最新的对话数量
+
+# 加载配置文件
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yml")
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    CONFIG = yaml.safe_load(f)
+
+DASHSCOPE_API_KEY = CONFIG["api_keys"]["dashscope"]
 
 #===========================================工具===========================================
 
@@ -173,7 +181,7 @@ aliyun = init_chat_model(
     model="glm-5",
     model_provider="openai",
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    api_key="sk-4f5ae3095bc04c259412db341254b745",
+    api_key=DASHSCOPE_API_KEY,
 )
 
 WORKSPACE_DIR = os.path.join(os.path.dirname(__file__), "workspace")
