@@ -48,12 +48,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# 加载配置文件
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yml")
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-    CONFIG = yaml.safe_load(f)
-
-DASHSCOPE_API_KEY          = CONFIG["api_keys"]["dashscope"]
+# 从环境变量获取API key
+DASHSCOPE_API_KEY          = os.environ.get("DASHSCOPE_API_KEY")
+if not DASHSCOPE_API_KEY:
+    raise ValueError("环境变量 DASHSCOPE_API_KEY 未设置")
 DASHSCOPE_EMBED_MODEL      = "text-embedding-v4"
 DASHSCOPE_EMBED_DIMENSIONS = 1024
 DASHSCOPE_BATCH_SIZE       = 10
