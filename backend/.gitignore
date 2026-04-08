@@ -1,6 +1,9 @@
 # API配置文件
 config.yml
 
+chroma_db/
+workspace/
+
 # 虚拟环境
 venv/
 env/
