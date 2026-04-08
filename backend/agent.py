@@ -16,6 +16,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from search_tools import search_file as chroma_search
+from bm25 import search as bm25_search
 
 #==========================================全局变量==========================================
 
@@ -111,6 +112,31 @@ def search_file(question: str) -> str:
     return result
 
 
+@tool
+def search_bm25(question: str, folder: str = None, top_k: int = 5) -> str:
+    """
+    使用BM25算法在指定文件夹中搜索相关文档，返回文件名和BM25分数。
+    如果不指定folder，则默认搜索工作目录。
+    用于快速查找与问题相关的文件。
+    """
+    if folder is None:
+        folder = WORKSPACE_DIR
+    print(f"bm25 searching: {question} in {folder}")
+    try:
+        results = bm25_search(question, folder=folder, top_k=top_k)
+        if not results:
+            return "未找到相关文档"
+        
+        output = []
+        output.append(f"找到 {len(results)} 个相关文档:")
+        for filename, score in results:
+            output.append(f"  {filename}: {score:.4f}")
+        
+        return "\n".join(output)
+    except Exception as e:
+        return f"搜索失败: {e}"
+
+
 #===========================================中间件===========================================
 
 
@@ -186,11 +212,11 @@ WORKSPACE_DIR = os.path.join(os.path.dirname(__file__), "workspace")
 
 agent = create_agent(
     model=aliyun,
-    tools=[web_fetch,run_powershell,read_file,search_file],
+    tools=[web_fetch,run_powershell,read_file,search_file,search_bm25],
     system_prompt=f"""
     你是一个在用户电脑本地的ai助手，你的工作目录是{WORKSPACE_DIR}。
     当用户想你发送信息时，你需要先判断是否需要执行任务，如果你认为有执行任务的必要，再去执行。
-    如果你发现自己的信息不足，可以先在工作目录中查询，若依旧不知道信息，则直接询问用户。
+    当你需要检索信息时，你可以先调用search_file工具查询本地向量数据库，若搜索不到，根据切片的来源文件路径用read_file工具读取文件内容，如果还是没有找到，使用BM25工具搜索相关文件并读取文件内容，最后如果还是没有找到，直接询问用户。
     当你要执行权限比较高的任务时，比如删除文件，一定要先跟用户确认。
     除非有用户允许，你的所有操作要限制在工作目录内。
     每次执行完任务要总结并告知用户自己用了哪些工具干了什么，结果怎么样。
