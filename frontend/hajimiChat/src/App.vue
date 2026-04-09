@@ -13,7 +13,7 @@ const userInput = ref('')
 const isWaitingForResponse = ref(false)
 const textareaHeight = ref('48px')
 
-const API_URL = 'http://localhost:5000/api/chat'
+const API_URL = '/api/chat'
 
 function autoResizeTextarea() {
   const textarea = document.getElementById('userInput')
@@ -47,31 +47,113 @@ function escapeHtml(str) {
 }
 
 async function sendMessageToAI(message) {
-  try {
-    const response = await fetch(API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ message: message }),
-    })
-    
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}))
-      throw new Error(errorData.error || `请求失败 (${response.status})`)
+  const response = await fetch('/api/chat/stream', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ message: message }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`请求失败 (${response.status})`)
+  }
+
+  if (!response.body) {
+    throw new Error('流式响应不可用')
+  }
+
+  return response.body
+}
+
+function formatTraceMessage(trace) {
+  if (!trace || !trace.type) return ''
+
+  if (trace.type === 'tool_call') {
+    return `⏳ 正在调用工具：${trace.name || 'unknown'}`
+  }
+
+  if (trace.type === 'tool_result') {
+    const status = trace.status === 'error' ? '❌' : '✅'
+    return `${status} 工具完成：${trace.name || 'unknown'}`
+  }
+
+  return ''
+}
+
+function upsertToolStatus(aiMessage, evt, status) {
+  if (!aiMessage.toolStates) aiMessage.toolStates = []
+  const callId = evt.call_id || `${evt.name || 'unknown'}_${Date.now()}`
+  const idx = aiMessage.toolStates.findIndex(t => t.callId === callId)
+  if (idx >= 0) {
+    aiMessage.toolStates[idx].status = status
+    aiMessage.toolStates[idx].name = evt.name || aiMessage.toolStates[idx].name
+    return
+  }
+  aiMessage.toolStates.push({
+    callId,
+    name: evt.name || 'unknown',
+    status,
+  })
+}
+
+function ensureStep(aiMessage, stepId) {
+  if (!aiMessage.thinkingSteps) aiMessage.thinkingSteps = []
+  let step = aiMessage.thinkingSteps.find(s => s.stepId === stepId)
+  if (!step) {
+    step = { stepId, content: '', done: false, kind: 'thinking', startedAt: Date.now() }
+    aiMessage.thinkingSteps.push(step)
+  }
+  return step
+}
+
+function upsertToolThinkingStep(aiMessage, evt, done = false) {
+  const sid = `tool_${evt.call_id || evt.name || Date.now()}`
+  const step = ensureStep(aiMessage, sid)
+  step.content = `调用工具：${evt.name || 'unknown'}`
+  step.done = done
+  step.kind = 'tool'
+  return step
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function readStreamEvents(stream, onEvent) {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buffer = ''
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+
+    for (const line of lines) {
+      const text = line.trim()
+      if (!text) continue
+      if (!text.startsWith('data:')) continue
+      try {
+        const evt = JSON.parse(text.slice(5).trim())
+        await onEvent(evt)
+      } catch (e) {
+        console.warn('无法解析流事件:', text, e)
+      }
     }
-    
-    const data = await response.json()
-    if (data.reply !== undefined) {
-      return data.reply
-    } else if (data.error) {
-      throw new Error(data.error)
-    } else {
-      throw new Error('未知的响应格式')
+  }
+
+  if (buffer.trim()) {
+    const tail = buffer.trim()
+    if (!tail.startsWith('data:')) return
+    try {
+      await onEvent(JSON.parse(tail.slice(5).trim()))
+    } catch (e) {
+      console.warn('无法解析末尾流事件:', buffer, e)
     }
-  } catch (err) {
-    console.error('API调用错误:', err)
-    throw err
   }
 }
 
@@ -94,18 +176,102 @@ async function handleSend() {
   await nextTick()
   scrollToBottom()
   
+  let aiMessageIndex = -1
   try {
-    const aiReply = await sendMessageToAI(rawMessage)
-    chatMessages.value.push({
+    aiMessageIndex = chatMessages.value.push({
       sender: 'ai',
-      content: aiReply
+      content: '',
+      isStreaming: true,
+      toolStates: [],
+      thinkingSteps: [],
+    }) - 1
+
+    const getAiMessage = () => chatMessages.value[aiMessageIndex]
+    const stream = await sendMessageToAI(rawMessage)
+    await readStreamEvents(stream, async (evt) => {
+      if (!evt || !evt.type) return
+      const aiMessage = getAiMessage()
+      if (!aiMessage) return
+
+      if (evt.type === 'tool_start') {
+        upsertToolStatus(aiMessage, evt, 'running')
+        upsertToolThinkingStep(aiMessage, evt, false)
+        await nextTick()
+        return
+      }
+
+      if (evt.type === 'tool_end') {
+        const toolStepId = `tool_${evt.call_id || evt.name || ''}`
+        const toolStep = aiMessage.thinkingSteps?.find(s => s.stepId === toolStepId)
+        const elapsed = toolStep ? Date.now() - (toolStep.startedAt || Date.now()) : 0
+        const minPendingMs = 450
+        if (elapsed < minPendingMs) {
+          await sleep(minPendingMs - elapsed)
+        }
+        upsertToolStatus(aiMessage, evt, 'done')
+        upsertToolThinkingStep(aiMessage, evt, true)
+        await nextTick()
+        return
+      }
+
+      if (evt.type === 'answer_chunk') {
+        aiMessage.content += evt.content || ''
+        await nextTick()
+        return
+      }
+
+      if (evt.type === 'step_start') {
+        ensureStep(aiMessage, evt.step_id || `step_${Date.now()}`)
+        await nextTick()
+        return
+      }
+
+      if (evt.type === 'step_chunk') {
+        const step = ensureStep(aiMessage, evt.step_id || `step_${Date.now()}`)
+        step.content += evt.content || ''
+        await nextTick()
+        return
+      }
+
+      if (evt.type === 'step_done') {
+        const step = ensureStep(aiMessage, evt.step_id || `step_${Date.now()}`)
+        step.done = true
+        await nextTick()
+        return
+      }
+
+      if (evt.type === 'error') {
+        aiMessage.content += `\n⚠️ 后端执行出错：${evt.message || '未知错误'}`
+        aiMessage.isStreaming = false
+        await nextTick()
+        return
+      }
+
+      if (evt.type === 'done') {
+        aiMessage.isStreaming = false
+        await nextTick()
+      }
     })
+
+    const aiMessage = getAiMessage()
+    if (aiMessage && !aiMessage.content.trim()) {
+      aiMessage.content = '（空响应）'
+    }
+    if (aiMessage) {
+      aiMessage.isStreaming = false
+    }
   } catch (error) {
     const errorMsg = error.message || '服务暂时不可用，请稍后再试。'
-    chatMessages.value.push({
-      sender: 'ai',
-      content: `⚠️ 抱歉，发生错误: ${errorMsg}`
-    })
+    const aiMessage = aiMessageIndex >= 0 ? chatMessages.value[aiMessageIndex] : null
+    if (aiMessage) {
+      aiMessage.content = `⚠️ 抱歉，发生错误: ${errorMsg}`
+      aiMessage.isStreaming = false
+    } else {
+      chatMessages.value.push({
+        sender: 'ai',
+        content: `⚠️ 抱歉，发生错误: ${errorMsg}`
+      })
+    }
     console.error('发送失败:', error)
   } finally {
     isWaitingForResponse.value = false
@@ -143,7 +309,7 @@ async function checkBackendHealth() {
       console.log('后端连接正常')
     }
   } catch (err) {
-    console.warn('无法连接到后端服务，请确认服务端已启动 (http://localhost:5000/api/chat)')
+    console.warn('无法连接到后端服务，请确认后端已启动并可通过 Vite 代理访问 /api/chat')
   }
 }
 
@@ -192,16 +358,44 @@ onMounted(() => {
           <div v-if="message.sender === 'ai'" class="w-8 h-8 rounded-full bg-gradient-to-r from-indigo-500 to-blue-500 flex-shrink-0 flex items-center justify-center shadow-sm overflow-hidden">
             <img src="/hajimi.jpg" alt="AI助手" class="w-full h-full object-cover">
           </div>
-          
-          <div 
-            :class="[
-              'message-bubble px-4 py-2.5',
-              message.sender === 'user' 
-                ? 'bg-gradient-to-br from-blue-500 to-blue-600 text-white rounded-2xl rounded-tr-md shadow-sm'
-                : 'bg-white border border-slate-100 shadow-sm rounded-2xl rounded-tl-md'
-            ]"
-            v-html="message.sender === 'ai' ? marked.parse(message.content) : escapeHtml(message.content)"
-          ></div>
+
+          <div class="flex flex-col gap-1">
+            <div
+              v-if="message.sender === 'ai' && ((message.thinkingSteps && message.thinkingSteps.length) || message.isStreaming)"
+              class="flex flex-col gap-1 text-[12px]"
+            >
+              <div
+                v-if="(!message.thinkingSteps || !message.thinkingSteps.length) && message.isStreaming"
+                class="px-2 py-1 rounded bg-slate-50 text-slate-600 border border-slate-200"
+              >
+                <span class="mr-1">🧠</span>思考中...
+              </div>
+              <div
+                v-for="step in message.thinkingSteps"
+                :key="step.stepId"
+                :class="[
+                  'px-2 py-1 rounded border',
+                  step.kind === 'tool'
+                    ? (step.done
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : 'bg-amber-50 text-amber-700 border-amber-200')
+                    : 'bg-slate-50 text-slate-600 border-slate-200'
+                ]"
+              >
+                <span class="mr-1">{{ step.kind === 'tool' ? (step.done ? '✅' : '⏳') : '🧠' }}</span>{{ step.content || '思考中...' }}
+              </div>
+            </div>
+
+            <div 
+              :class="[
+                'message-bubble px-4 py-2.5',
+                message.sender === 'user' 
+                  ? 'bg-gradient-to-br from-blue-500 to-blue-600 text-white rounded-2xl rounded-tr-md shadow-sm'
+                  : 'bg-white border border-slate-100 shadow-sm rounded-2xl rounded-tl-md'
+              ]"
+              v-html="(message.sender === 'ai' || message.sender === 'tool') ? marked.parse(message.content) : escapeHtml(message.content)"
+            ></div>
+          </div>
           
           <div v-if="message.sender === 'user'" class="w-8 h-8 rounded-full bg-slate-200 flex-shrink-0 flex items-center justify-center shadow-inner">
             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="#475569" class="w-4 h-4">
@@ -210,17 +404,6 @@ onMounted(() => {
           </div>
         </div>
 
-        <!-- 正在输入指示器 -->
-        <div v-if="isWaitingForResponse" class="flex items-start gap-2.5 fade-in-up">
-          <div class="w-8 h-8 rounded-full bg-gradient-to-r from-indigo-500 to-blue-500 flex-shrink-0 flex items-center justify-center shadow-sm overflow-hidden">
-            <img src="/hajimi.jpg" alt="AI助手" class="w-full h-full object-cover">
-          </div>
-          <div class="bg-white/80 border border-slate-200 shadow-sm rounded-2xl rounded-tl-md px-4 py-2.5">
-            <div class="dot-pulse">
-              <span></span><span></span><span></span>
-            </div>
-          </div>
-        </div>
       </div>
 
       <!-- 底部输入区 -->

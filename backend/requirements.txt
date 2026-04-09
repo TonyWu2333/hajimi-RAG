@@ -1,0 +1,12 @@
+bs4
+langchain
+flask
+flask_cors
+jieba
+chromadb
+dashscope
+watchdog
+langchain-openai
+pypdf
+python-docx
+rank-bm25
