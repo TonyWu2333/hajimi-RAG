@@ -3,6 +3,7 @@ import os
 import subprocess
 import json
 import time
+import threading
 
 # 设置默认编码为UTF-8
 sys.stdout.reconfigure(encoding='utf-8')
@@ -18,6 +19,9 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from agent import agent
 
 app = Flask(__name__)
+
+# LangGraph 同步 stream 使用线程池；并发请求或客户端中途断开时，易出现 executor shutdown 后仍 submit 的回调错误。
+_agent_stream_lock = threading.Lock()
 CORS(app)
 
 def _format_content(content):
@@ -29,6 +33,26 @@ def _format_content(content):
         return json.dumps(content, ensure_ascii=False, indent=2)
     except Exception:
         return str(content)
+
+def _tool_call_args(call):
+    """Normalize tool call arguments to a dict for the stream UI."""
+    if isinstance(call, dict):
+        args = call.get("args")
+        if isinstance(args, dict):
+            return args
+        fn = call.get("function")
+        if isinstance(fn, dict):
+            raw = fn.get("arguments")
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                    return parsed if isinstance(parsed, dict) else {}
+                except Exception:
+                    return {}
+        return {}
+    args = getattr(call, "args", None)
+    return args if isinstance(args, dict) else {}
+
 
 def _serialize_tool_traces(messages):
     traces = []
@@ -64,86 +88,102 @@ def _iter_agent_events(user_input):
     - done
     - error
     """
+    tool_started = set()
+    tool_finished = set()
+    step_seq = 0
+
+    def emit(event):
+        return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    stream_iter = None
     try:
-        tool_started = set()
-        tool_finished = set()
-        step_seq = 0
-
-        def emit(event):
-            return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-
-        for chunk in agent.stream(
-            {"messages": [{"role": "user", "content": user_input}]},
-            {"configurable": {"thread_id": "1"}},
-            stream_mode="updates",
-        ):
-            if not isinstance(chunk, dict):
-                continue
-            for _, payload in chunk.items():
-                if not isinstance(payload, dict):
+        with _agent_stream_lock:
+            stream_iter = agent.stream(
+                {"messages": [{"role": "user", "content": user_input}]},
+                {"configurable": {"thread_id": "1"}},
+                stream_mode="updates",
+            )
+            for chunk in stream_iter:
+                if not isinstance(chunk, dict):
                     continue
-                for msg in payload.get("messages", []) or []:
-                    msg_type = getattr(msg, "type", "") or msg.__class__.__name__.lower()
+                for _, payload in chunk.items():
+                    if not isinstance(payload, dict):
+                        continue
+                    for msg in payload.get("messages", []) or []:
+                        msg_type = getattr(msg, "type", "") or msg.__class__.__name__.lower()
 
-                    if msg_type == "ai":
-                        tool_calls = getattr(msg, "tool_calls", None)
-                        if not tool_calls and hasattr(msg, "additional_kwargs"):
-                            tool_calls = msg.additional_kwargs.get("tool_calls")
-                        response_meta = getattr(msg, "response_metadata", {}) or {}
-                        finish_reason = response_meta.get("finish_reason")
-                        for call in tool_calls or []:
-                            if isinstance(call, dict):
-                                call_name = call.get("name", "工具")
-                                call_id = call.get("id") or f"{call_name}_{len(tool_started)}"
-                            else:
-                                call_name = getattr(call, "name", "工具")
-                                call_id = getattr(call, "id", None) or f"{call_name}_{len(tool_started)}"
-                            if call_id in tool_started:
-                                continue
-                            tool_started.add(call_id)
-                            yield emit({
-                                "type": "tool_start",
-                                "call_id": call_id,
-                                "name": call_name,
-                            })
+                        if msg_type == "ai":
+                            tool_calls = getattr(msg, "tool_calls", None)
+                            if not tool_calls and hasattr(msg, "additional_kwargs"):
+                                tool_calls = msg.additional_kwargs.get("tool_calls")
+                            response_meta = getattr(msg, "response_metadata", {}) or {}
+                            finish_reason = response_meta.get("finish_reason")
+                            text_chunk = getattr(msg, "content", "")
 
-                        text_chunk = getattr(msg, "content", "")
-                        if isinstance(text_chunk, str) and text_chunk.strip():
-                            # thinking: 中间步骤只进 thinking 框，不写入最终回答框
-                            is_thinking_step = bool(tool_calls) or finish_reason == "tool_calls"
-                            cut = 16
-                            if is_thinking_step:
-                                step_id = f"step_{step_seq}"
-                                step_seq += 1
-                                yield emit({"type": "step_start", "step_id": step_id})
-                                for i in range(0, len(text_chunk), cut):
-                                    part = text_chunk[i:i + cut]
-                                    yield emit({"type": "step_chunk", "step_id": step_id, "content": part})
-                                    time.sleep(0.01)
-                                yield emit({"type": "step_done", "step_id": step_id})
-                            else:
-                                for i in range(0, len(text_chunk), cut):
-                                    part = text_chunk[i:i + cut]
-                                    yield emit({"type": "answer_chunk", "content": part})
-                                    time.sleep(0.01)
+                            # 先推送思考文本，再推送工具调用，前端才能「先思考、后工具」
+                            if isinstance(text_chunk, str) and text_chunk.strip():
+                                is_thinking_step = bool(tool_calls) or finish_reason == "tool_calls"
+                                cut = 16
+                                if is_thinking_step:
+                                    step_id = f"step_{step_seq}"
+                                    step_seq += 1
+                                    yield emit({"type": "step_start", "step_id": step_id})
+                                    for i in range(0, len(text_chunk), cut):
+                                        part = text_chunk[i:i + cut]
+                                        yield emit({"type": "step_chunk", "step_id": step_id, "content": part})
+                                        time.sleep(0.01)
+                                    yield emit({"type": "step_done", "step_id": step_id})
+                                else:
+                                    for i in range(0, len(text_chunk), cut):
+                                        part = text_chunk[i:i + cut]
+                                        yield emit({"type": "answer_chunk", "content": part})
+                                        time.sleep(0.01)
 
-                    elif msg_type == "tool":
-                        call_id = getattr(msg, "tool_call_id", None) or f"{getattr(msg, 'name', 'unknown')}_{len(tool_finished)}"
-                        if call_id not in tool_finished:
-                            tool_finished.add(call_id)
-                            yield emit({
-                                "type": "tool_end",
-                                "call_id": call_id,
-                                "name": getattr(msg, "name", "unknown"),
-                                "status": "success",
-                            })
+                            for call in tool_calls or []:
+                                if isinstance(call, dict):
+                                    call_name = call.get("name")
+                                    if not call_name:
+                                        fn = call.get("function")
+                                        if isinstance(fn, dict):
+                                            call_name = fn.get("name", "工具")
+                                    call_name = call_name or "工具"
+                                    call_id = call.get("id") or f"{call_name}_{len(tool_started)}"
+                                else:
+                                    call_name = getattr(call, "name", "工具")
+                                    call_id = getattr(call, "id", None) or f"{call_name}_{len(tool_started)}"
+                                if call_id in tool_started:
+                                    continue
+                                tool_started.add(call_id)
+                                yield emit({
+                                    "type": "tool_start",
+                                    "call_id": call_id,
+                                    "name": call_name,
+                                    "args": _tool_call_args(call),
+                                })
 
-        yield emit({"type": "done"})
+                        elif msg_type == "tool":
+                            call_id = getattr(msg, "tool_call_id", None) or f"{getattr(msg, 'name', 'unknown')}_{len(tool_finished)}"
+                            if call_id not in tool_finished:
+                                tool_finished.add(call_id)
+                                yield emit({
+                                    "type": "tool_end",
+                                    "call_id": call_id,
+                                    "name": getattr(msg, "name", "unknown"),
+                                    "status": "success",
+                                })
+
+            yield emit({"type": "done"})
 
     except Exception as e:
         err_text = str(e)
         yield emit({"type": "error", "message": err_text})
         yield emit({"type": "done"})
+    finally:
+        if stream_iter is not None:
+            try:
+                stream_iter.close()
+            except Exception:
+                pass
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
@@ -154,11 +194,12 @@ def chat():
         if not user_input:
             return jsonify({'error': 'No message provided'}), 400
         
-        # 调用agent处理消息
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": user_input}]},
-            {"configurable": {"thread_id": "1"}},
-        )
+        # 与流式接口共用锁，避免与 stream 并行触发 LangGraph 线程池竞态
+        with _agent_stream_lock:
+            result = agent.invoke(
+                {"messages": [{"role": "user", "content": user_input}]},
+                {"configurable": {"thread_id": "1"}},
+            )
         
         # 获取AI回复
         ai_reply = result["messages"][-1].content
@@ -189,6 +230,7 @@ def chat_stream():
     )
 
 if __name__ == '__main__':
+    # debug 且默认 use_reloader=True 时会双进程，易与 LangGraph 线程池交错；本地开发可关 reloader 减少偶发 executor 错误
     # 启动chroma.py子进程
     # chroma_process = subprocess.Popen(
     #     ['python', 'chroma.py', '--source', './workspace', '--db', './chroma_db'],
@@ -199,4 +241,4 @@ if __name__ == '__main__':
     # print("ChromaDB索引服务已启动")
     
     # 启动Flask应用
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)

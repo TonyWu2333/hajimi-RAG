@@ -107,10 +107,28 @@ function ensureStep(aiMessage, stepId) {
   return step
 }
 
+function formatToolStepText(evt) {
+  const name = evt.name || 'unknown'
+  const args = evt.args && typeof evt.args === 'object' ? evt.args : {}
+  const terminalTools = new Set(['run_command', 'run_powershell', 'run_shell_command'])
+  if (terminalTools.has(name)) {
+    const cmd = args.command ?? args.cmd ?? ''
+    if (cmd !== '') {
+      return `终端运行：${cmd}`
+    }
+    return '终端运行：（无命令参数）'
+  }
+  return `调用工具：${name}`
+}
+
 function upsertToolThinkingStep(aiMessage, evt, done = false) {
   const sid = `tool_${evt.call_id || evt.name || Date.now()}`
+  const existed = !!(aiMessage.thinkingSteps && aiMessage.thinkingSteps.some(s => s.stepId === sid))
   const step = ensureStep(aiMessage, sid)
-  step.content = `调用工具：${evt.name || 'unknown'}`
+  // tool_end 事件通常不带 args，避免覆盖 tool_start 已写好的「终端运行：…」
+  if (!existed || !done) {
+    step.content = formatToolStepText(evt)
+  }
   step.done = done
   step.kind = 'tool'
   return step
@@ -359,14 +377,21 @@ onMounted(() => {
             <img src="/hajimi.jpg" alt="AI助手" class="w-full h-full object-cover">
           </div>
 
-          <div class="flex flex-col gap-1">
+          <div
+            :class="[
+              'flex flex-col gap-1',
+              message.sender === 'user'
+                ? 'min-w-0 max-w-[85%] sm:max-w-[75%] items-end self-end'
+                : 'min-w-0 max-w-full items-start'
+            ]"
+          >
             <div
               v-if="message.sender === 'ai' && ((message.thinkingSteps && message.thinkingSteps.length) || message.isStreaming)"
-              class="flex flex-col gap-1 text-[12px]"
+              class="flex flex-col gap-1 items-start text-[12px] w-full"
             >
               <div
                 v-if="(!message.thinkingSteps || !message.thinkingSteps.length) && message.isStreaming"
-                class="px-2 py-1 rounded bg-slate-50 text-slate-600 border border-slate-200"
+                class="thinking-step-pill px-2 py-1 rounded bg-slate-50 text-slate-600 border border-slate-200"
               >
                 <span class="mr-1">🧠</span>思考中...
               </div>
@@ -374,7 +399,7 @@ onMounted(() => {
                 v-for="step in message.thinkingSteps"
                 :key="step.stepId"
                 :class="[
-                  'px-2 py-1 rounded border',
+                  'thinking-step-pill px-2 py-1 rounded border',
                   step.kind === 'tool'
                     ? (step.done
                       ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
@@ -390,8 +415,8 @@ onMounted(() => {
               :class="[
                 'message-bubble px-4 py-2.5',
                 message.sender === 'user' 
-                  ? 'bg-gradient-to-br from-blue-500 to-blue-600 text-white rounded-2xl rounded-tr-md shadow-sm'
-                  : 'bg-white border border-slate-100 shadow-sm rounded-2xl rounded-tl-md'
+                  ? 'message-bubble-user bg-gradient-to-br from-blue-500 to-blue-600 text-white rounded-2xl rounded-tr-md shadow-sm'
+                  : 'message-bubble-ai bg-white border border-slate-100 shadow-sm rounded-2xl rounded-tl-md'
               ]"
               v-html="(message.sender === 'ai' || message.sender === 'tool') ? marked.parse(message.content) : escapeHtml(message.content)"
             ></div>
@@ -491,15 +516,36 @@ onMounted(() => {
   background: radial-gradient(circle at 10% 20%, rgba(59,130,246,0.03) 0%, rgba(0,0,0,0) 70%);
 }
 
-/* 消息气泡最大宽度限制 */
-.message-bubble {
+/* 思考 / 工具条：宽度随内容，最长不超过会话列 */
+.thinking-step-pill {
+  box-sizing: border-box;
+  width: fit-content;
+  max-width: 100%;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+
+/* AI 气泡：占满可用列宽的一部分 */
+.message-bubble-ai {
   max-width: 85%;
   word-wrap: break-word;
+  overflow-wrap: break-word;
 }
 @media (min-width: 640px) {
-  .message-bubble {
+  .message-bubble-ai {
     max-width: 75%;
   }
+}
+
+/* 用户气泡：按文字自然宽度扩展，避免被 85% 父宽 + break-word 拆成一字一行 */
+.message-bubble-user {
+  box-sizing: border-box;
+  width: fit-content;
+  max-width: 100%;
+  white-space: pre-wrap;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+  line-break: loose;
 }
 
 /* 简单的loading点动画 */
