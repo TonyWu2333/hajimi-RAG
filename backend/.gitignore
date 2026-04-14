@@ -2,7 +2,7 @@
 config.yml
 
 chroma_db/
-workspace/
+# workspace/
 
 # 虚拟环境
 venv/
