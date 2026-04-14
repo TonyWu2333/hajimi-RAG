@@ -177,5 +177,5 @@ def format_results(documents: list, metadatas: list, distances: list,
         result_str += "-" * 80 + "\n"
     return result_str
 
-result = search_file("竞品分析")
-print(result)
+# result = search_file("竞品分析")
+# print(result)
